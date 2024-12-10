@@ -3212,7 +3212,7 @@ struct AMDGPUPluginTy final : public GenericPluginTy {
     for (auto &Target : Targets)
       if (offloading::amdgpu::isImageCompatibleWithEnv(
               Processor ? *Processor : "", ElfOrErr->getPlatformFlags(),
-              Target.str()))
+              Target))
         return true;
     return false;
   }
