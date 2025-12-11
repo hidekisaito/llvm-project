@@ -1,0 +1,607 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -run-pass=si-insert-waitcnts -amdgpu-waitcnt-loop-ds-opt=true -verify-machineinstrs -o - %s | FileCheck -check-prefix=OPT %s
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -run-pass=si-insert-waitcnts -amdgpu-waitcnt-loop-ds-opt=false -verify-machineinstrs -o - %s | FileCheck -check-prefix=NOOPT %s
+
+# Test for DS loop wait optimization in single-block loops with WMMA.
+# Both positive and negative tests. In the positive test (first function),
+# the preheader DS loads are in reverse order compared to loop body loads,
+# which causes the baseline to produce conservative waits that the optimization
+# can relax. Negative test has an expected improvement below the threshold and
+# thus optimization does not kick-in.
+#
+# Key improvement demonstrated:
+#   Without opt: S_WAIT_DSCNT 0 (wait for ALL 16 loads) before first WMMA
+#   With opt:    S_WAIT_DSCNT 12 (wait for only 4 loads, 12 remain in flight)
+
+--- |
+  define amdgpu_kernel void @ds_loop_opt_test() { ret void }
+  define amdgpu_kernel void @ds_loop_no_improvement() { ret void }
+  define amdgpu_kernel void @ds_loop_same_iter_use() { ret void }
+  define amdgpu_kernel void @ds_loop_same_iter_overwrite() { ret void }
+  define amdgpu_kernel void @ds_loop_same_iter_use_load4() { ret void }
+  define amdgpu_kernel void @ds_loop_tensor_load() { ret void }
+...
+
+---
+name: ds_loop_opt_test
+tracksRegLiveness: true
+machineFunctionInfo:
+  isEntryFunction: true
+  waveLimiter: false
+body: |
+  ; OPT-LABEL: name: ds_loop_opt_test
+  ; NOOPT-LABEL: name: ds_loop_opt_test
+
+  ; Check preheader: OPT adds S_WAIT_DSCNT 0 flush, NOOPT does not
+  ; OPT: bb.0:
+  ; OPT: S_WAIT_DSCNT_soft 0
+  ; OPT-NEXT: S_BRANCH %bb.1
+
+  ; NOOPT: bb.0:
+  ; NOOPT-NOT: S_WAIT_DSCNT
+  ; NOOPT: S_BRANCH %bb.1
+
+  bb.0:
+    successors: %bb.1
+    liveins: $sgpr0, $vgpr0
+
+    ; Preheader: DS loads in REVERSE order (last registers first)
+    ; This creates different register scores than the loop body order,
+    ; causing baseline to be conservative when merging predecessor info.
+    $vgpr70_vgpr71_vgpr72_vgpr73 = DS_READ_B128 $vgpr0, 240, 0, implicit $m0, implicit $exec
+    $vgpr66_vgpr67_vgpr68_vgpr69 = DS_READ_B128 $vgpr0, 224, 0, implicit $m0, implicit $exec
+    $vgpr62_vgpr63_vgpr64_vgpr65 = DS_READ_B128 $vgpr0, 208, 0, implicit $m0, implicit $exec
+    $vgpr58_vgpr59_vgpr60_vgpr61 = DS_READ_B128 $vgpr0, 192, 0, implicit $m0, implicit $exec
+    $vgpr54_vgpr55_vgpr56_vgpr57 = DS_READ_B128 $vgpr0, 176, 0, implicit $m0, implicit $exec
+    $vgpr50_vgpr51_vgpr52_vgpr53 = DS_READ_B128 $vgpr0, 160, 0, implicit $m0, implicit $exec
+    $vgpr46_vgpr47_vgpr48_vgpr49 = DS_READ_B128 $vgpr0, 144, 0, implicit $m0, implicit $exec
+    $vgpr42_vgpr43_vgpr44_vgpr45 = DS_READ_B128 $vgpr0, 128, 0, implicit $m0, implicit $exec
+    $vgpr38_vgpr39_vgpr40_vgpr41 = DS_READ_B128 $vgpr0, 112, 0, implicit $m0, implicit $exec
+    $vgpr34_vgpr35_vgpr36_vgpr37 = DS_READ_B128 $vgpr0, 96, 0, implicit $m0, implicit $exec
+    $vgpr30_vgpr31_vgpr32_vgpr33 = DS_READ_B128 $vgpr0, 80, 0, implicit $m0, implicit $exec
+    $vgpr26_vgpr27_vgpr28_vgpr29 = DS_READ_B128 $vgpr0, 64, 0, implicit $m0, implicit $exec
+    $vgpr22_vgpr23_vgpr24_vgpr25 = DS_READ_B128 $vgpr0, 48, 0, implicit $m0, implicit $exec
+    $vgpr18_vgpr19_vgpr20_vgpr21 = DS_READ_B128 $vgpr0, 32, 0, implicit $m0, implicit $exec
+    $vgpr14_vgpr15_vgpr16_vgpr17 = DS_READ_B128 $vgpr0, 16, 0, implicit $m0, implicit $exec
+    $vgpr10_vgpr11_vgpr12_vgpr13 = DS_READ_B128 $vgpr0, 0, 0, implicit $m0, implicit $exec
+    S_BRANCH %bb.1
+
+  ; OPT: bb.1:
+  ; OPT: S_WAIT_DSCNT 12
+  ; OPT-NEXT: early-clobber $vgpr80{{.*}} = V_WMMA
+  ; OPT: S_WAIT_DSCNT 8
+  ; OPT-NEXT: early-clobber $vgpr88{{.*}} = V_WMMA
+
+  ; NOOPT: bb.1:
+  ; NOOPT: S_WAIT_DSCNT 0
+  ; NOOPT-NEXT: early-clobber $vgpr80{{.*}} = V_WMMA
+  ; NOOPT-NOT: S_WAIT_DSCNT 8
+
+  bb.1:
+    ; Single-block loop with WMMA and DS loads after barrier
+    successors: %bb.1, %bb.2
+    liveins: $sgpr0, $vgpr0, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95
+
+    ; First WMMA uses vgpr10-25 (loads #1-4 in loop body order)
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, 8, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, 8, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, 8, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, 8, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, 8, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, 8, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+
+    ; Barrier separates compute from prefetch
+    S_BARRIER
+
+    ; Prefetch DS loads for next iteration (in FORWARD order)
+    $vgpr10_vgpr11_vgpr12_vgpr13 = DS_READ_B128 $vgpr0, 0, 0, implicit $m0, implicit $exec
+    $vgpr14_vgpr15_vgpr16_vgpr17 = DS_READ_B128 $vgpr0, 16, 0, implicit $m0, implicit $exec
+    $vgpr18_vgpr19_vgpr20_vgpr21 = DS_READ_B128 $vgpr0, 32, 0, implicit $m0, implicit $exec
+    $vgpr22_vgpr23_vgpr24_vgpr25 = DS_READ_B128 $vgpr0, 48, 0, implicit $m0, implicit $exec
+    $vgpr26_vgpr27_vgpr28_vgpr29 = DS_READ_B128 $vgpr0, 64, 0, implicit $m0, implicit $exec
+    $vgpr30_vgpr31_vgpr32_vgpr33 = DS_READ_B128 $vgpr0, 80, 0, implicit $m0, implicit $exec
+    $vgpr34_vgpr35_vgpr36_vgpr37 = DS_READ_B128 $vgpr0, 96, 0, implicit $m0, implicit $exec
+    $vgpr38_vgpr39_vgpr40_vgpr41 = DS_READ_B128 $vgpr0, 112, 0, implicit $m0, implicit $exec
+    $vgpr42_vgpr43_vgpr44_vgpr45 = DS_READ_B128 $vgpr0, 128, 0, implicit $m0, implicit $exec
+    $vgpr46_vgpr47_vgpr48_vgpr49 = DS_READ_B128 $vgpr0, 144, 0, implicit $m0, implicit $exec
+    $vgpr50_vgpr51_vgpr52_vgpr53 = DS_READ_B128 $vgpr0, 160, 0, implicit $m0, implicit $exec
+    $vgpr54_vgpr55_vgpr56_vgpr57 = DS_READ_B128 $vgpr0, 176, 0, implicit $m0, implicit $exec
+    $vgpr58_vgpr59_vgpr60_vgpr61 = DS_READ_B128 $vgpr0, 192, 0, implicit $m0, implicit $exec
+    $vgpr62_vgpr63_vgpr64_vgpr65 = DS_READ_B128 $vgpr0, 208, 0, implicit $m0, implicit $exec
+    $vgpr66_vgpr67_vgpr68_vgpr69 = DS_READ_B128 $vgpr0, 224, 0, implicit $m0, implicit $exec
+    $vgpr70_vgpr71_vgpr72_vgpr73 = DS_READ_B128 $vgpr0, 240, 0, implicit $m0, implicit $exec
+
+    ; Loop control
+    $sgpr0 = S_ADD_I32 $sgpr0, -1, implicit-def $scc
+    S_CBRANCH_SCC1 %bb.1, implicit $scc
+    S_BRANCH %bb.2
+
+  bb.2:
+    S_ENDPGM 0
+
+---
+# Second test: preheader loads with slight reordering
+# Baseline is close to optimal, improvement below threshold of 4
+# Both OPT and NOOPT should produce the same wait count.
+name: ds_loop_no_improvement
+tracksRegLiveness: true
+machineFunctionInfo:
+  isEntryFunction: true
+  waveLimiter: false
+body: |
+  ; OPT-LABEL: name: ds_loop_no_improvement
+  ; NOOPT-LABEL: name: ds_loop_no_improvement
+
+  ; Check preheader: neither OPT nor NOOPT adds flush (optimization doesn't apply)
+  ; OPT: bb.0:
+  ; OPT-NOT: S_WAIT_DSCNT
+  ; OPT: S_BRANCH %bb.1
+
+  ; NOOPT: bb.0:
+  ; NOOPT-NOT: S_WAIT_DSCNT
+  ; NOOPT: S_BRANCH %bb.1
+
+  bb.0:
+    successors: %bb.1
+    liveins: $sgpr0, $vgpr0
+
+    ; Preheader: DS loads with slight reordering (Pulled up Loads #5 and #6)
+    ; This creates a small mismatch with loop body order, so baseline is
+    ; close to optimal but not perfect. Improvement should be below threshold.
+    $vgpr26_vgpr27_vgpr28_vgpr29 = DS_READ_B128 $vgpr0, 64, 0, implicit $m0, implicit $exec
+    $vgpr30_vgpr31_vgpr32_vgpr33 = DS_READ_B128 $vgpr0, 80, 0, implicit $m0, implicit $exec
+    $vgpr10_vgpr11_vgpr12_vgpr13 = DS_READ_B128 $vgpr0, 0, 0, implicit $m0, implicit $exec
+    $vgpr14_vgpr15_vgpr16_vgpr17 = DS_READ_B128 $vgpr0, 16, 0, implicit $m0, implicit $exec
+    $vgpr18_vgpr19_vgpr20_vgpr21 = DS_READ_B128 $vgpr0, 32, 0, implicit $m0, implicit $exec
+    $vgpr22_vgpr23_vgpr24_vgpr25 = DS_READ_B128 $vgpr0, 48, 0, implicit $m0, implicit $exec
+    $vgpr34_vgpr35_vgpr36_vgpr37 = DS_READ_B128 $vgpr0, 96, 0, implicit $m0, implicit $exec
+    $vgpr38_vgpr39_vgpr40_vgpr41 = DS_READ_B128 $vgpr0, 112, 0, implicit $m0, implicit $exec
+    $vgpr42_vgpr43_vgpr44_vgpr45 = DS_READ_B128 $vgpr0, 128, 0, implicit $m0, implicit $exec
+    $vgpr46_vgpr47_vgpr48_vgpr49 = DS_READ_B128 $vgpr0, 144, 0, implicit $m0, implicit $exec
+    $vgpr50_vgpr51_vgpr52_vgpr53 = DS_READ_B128 $vgpr0, 160, 0, implicit $m0, implicit $exec
+    $vgpr54_vgpr55_vgpr56_vgpr57 = DS_READ_B128 $vgpr0, 176, 0, implicit $m0, implicit $exec
+    $vgpr58_vgpr59_vgpr60_vgpr61 = DS_READ_B128 $vgpr0, 192, 0, implicit $m0, implicit $exec
+    $vgpr62_vgpr63_vgpr64_vgpr65 = DS_READ_B128 $vgpr0, 208, 0, implicit $m0, implicit $exec
+    $vgpr66_vgpr67_vgpr68_vgpr69 = DS_READ_B128 $vgpr0, 224, 0, implicit $m0, implicit $exec
+    $vgpr70_vgpr71_vgpr72_vgpr73 = DS_READ_B128 $vgpr0, 240, 0, implicit $m0, implicit $exec
+    S_BRANCH %bb.1
+
+  ; Preheader has loads #5,#6 first, then #1-4, then rest.
+  ; First WMMA uses loads #1-4 (vgpr10-25), which are at positions 3-6 in preheader.
+  ; Baseline produces S_WAIT_DSCNT 10 (wait for first 6 loads to complete).
+  ; Optimal would be 12 (only need first 4 loads in loop body order).
+  ; Improvement = 12 - 10 = 2, which is below threshold of 4, so no relaxation.
+  ; OPT: bb.1:
+  ; OPT: S_WAIT_DSCNT 10
+  ; OPT-NEXT: early-clobber $vgpr80{{.*}} = V_WMMA
+
+  ; NOOPT: bb.1:
+  ; NOOPT: S_WAIT_DSCNT 10
+  ; NOOPT-NEXT: early-clobber $vgpr80{{.*}} = V_WMMA
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $sgpr0, $vgpr0, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95
+
+    ; First WMMA uses vgpr10-25 (loads #1-4)
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, 8, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, 8, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, 8, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, 8, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, 8, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, 8, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+
+    S_BARRIER
+
+    ; Prefetch DS loads for next iteration (FORWARD order)
+    $vgpr10_vgpr11_vgpr12_vgpr13 = DS_READ_B128 $vgpr0, 0, 0, implicit $m0, implicit $exec
+    $vgpr14_vgpr15_vgpr16_vgpr17 = DS_READ_B128 $vgpr0, 16, 0, implicit $m0, implicit $exec
+    $vgpr18_vgpr19_vgpr20_vgpr21 = DS_READ_B128 $vgpr0, 32, 0, implicit $m0, implicit $exec
+    $vgpr22_vgpr23_vgpr24_vgpr25 = DS_READ_B128 $vgpr0, 48, 0, implicit $m0, implicit $exec
+    $vgpr26_vgpr27_vgpr28_vgpr29 = DS_READ_B128 $vgpr0, 64, 0, implicit $m0, implicit $exec
+    $vgpr30_vgpr31_vgpr32_vgpr33 = DS_READ_B128 $vgpr0, 80, 0, implicit $m0, implicit $exec
+    $vgpr34_vgpr35_vgpr36_vgpr37 = DS_READ_B128 $vgpr0, 96, 0, implicit $m0, implicit $exec
+    $vgpr38_vgpr39_vgpr40_vgpr41 = DS_READ_B128 $vgpr0, 112, 0, implicit $m0, implicit $exec
+    $vgpr42_vgpr43_vgpr44_vgpr45 = DS_READ_B128 $vgpr0, 128, 0, implicit $m0, implicit $exec
+    $vgpr46_vgpr47_vgpr48_vgpr49 = DS_READ_B128 $vgpr0, 144, 0, implicit $m0, implicit $exec
+    $vgpr50_vgpr51_vgpr52_vgpr53 = DS_READ_B128 $vgpr0, 160, 0, implicit $m0, implicit $exec
+    $vgpr54_vgpr55_vgpr56_vgpr57 = DS_READ_B128 $vgpr0, 176, 0, implicit $m0, implicit $exec
+    $vgpr58_vgpr59_vgpr60_vgpr61 = DS_READ_B128 $vgpr0, 192, 0, implicit $m0, implicit $exec
+    $vgpr62_vgpr63_vgpr64_vgpr65 = DS_READ_B128 $vgpr0, 208, 0, implicit $m0, implicit $exec
+    $vgpr66_vgpr67_vgpr68_vgpr69 = DS_READ_B128 $vgpr0, 224, 0, implicit $m0, implicit $exec
+    $vgpr70_vgpr71_vgpr72_vgpr73 = DS_READ_B128 $vgpr0, 240, 0, implicit $m0, implicit $exec
+
+    $sgpr0 = S_ADD_I32 $sgpr0, -1, implicit-def $scc
+    S_CBRANCH_SCC1 %bb.1, implicit $scc
+    S_BRANCH %bb.2
+
+  bb.2:
+    S_ENDPGM 0
+
+---
+# Third test: same-iteration USE of a DS load result (load #2 = vgpr14-17)
+# This flushes loads #1-2, leaving loads #3-16 (14 loads) as prefetch.
+# Tests that the analysis correctly handles same-iteration uses.
+name: ds_loop_same_iter_use
+tracksRegLiveness: true
+machineFunctionInfo:
+  isEntryFunction: true
+  waveLimiter: false
+body: |
+  ; OPT-LABEL: name: ds_loop_same_iter_use
+  ; NOOPT-LABEL: name: ds_loop_same_iter_use
+
+  bb.0:
+    successors: %bb.1
+    liveins: $sgpr0, $vgpr0
+
+    ; Preheader: DS loads in REVERSE order
+    $vgpr70_vgpr71_vgpr72_vgpr73 = DS_READ_B128 $vgpr0, 240, 0, implicit $m0, implicit $exec
+    $vgpr66_vgpr67_vgpr68_vgpr69 = DS_READ_B128 $vgpr0, 224, 0, implicit $m0, implicit $exec
+    $vgpr62_vgpr63_vgpr64_vgpr65 = DS_READ_B128 $vgpr0, 208, 0, implicit $m0, implicit $exec
+    $vgpr58_vgpr59_vgpr60_vgpr61 = DS_READ_B128 $vgpr0, 192, 0, implicit $m0, implicit $exec
+    $vgpr54_vgpr55_vgpr56_vgpr57 = DS_READ_B128 $vgpr0, 176, 0, implicit $m0, implicit $exec
+    $vgpr50_vgpr51_vgpr52_vgpr53 = DS_READ_B128 $vgpr0, 160, 0, implicit $m0, implicit $exec
+    $vgpr46_vgpr47_vgpr48_vgpr49 = DS_READ_B128 $vgpr0, 144, 0, implicit $m0, implicit $exec
+    $vgpr42_vgpr43_vgpr44_vgpr45 = DS_READ_B128 $vgpr0, 128, 0, implicit $m0, implicit $exec
+    $vgpr38_vgpr39_vgpr40_vgpr41 = DS_READ_B128 $vgpr0, 112, 0, implicit $m0, implicit $exec
+    $vgpr34_vgpr35_vgpr36_vgpr37 = DS_READ_B128 $vgpr0, 96, 0, implicit $m0, implicit $exec
+    $vgpr30_vgpr31_vgpr32_vgpr33 = DS_READ_B128 $vgpr0, 80, 0, implicit $m0, implicit $exec
+    $vgpr26_vgpr27_vgpr28_vgpr29 = DS_READ_B128 $vgpr0, 64, 0, implicit $m0, implicit $exec
+    $vgpr22_vgpr23_vgpr24_vgpr25 = DS_READ_B128 $vgpr0, 48, 0, implicit $m0, implicit $exec
+    $vgpr18_vgpr19_vgpr20_vgpr21 = DS_READ_B128 $vgpr0, 32, 0, implicit $m0, implicit $exec
+    $vgpr14_vgpr15_vgpr16_vgpr17 = DS_READ_B128 $vgpr0, 16, 0, implicit $m0, implicit $exec
+    $vgpr10_vgpr11_vgpr12_vgpr13 = DS_READ_B128 $vgpr0, 0, 0, implicit $m0, implicit $exec
+    S_BRANCH %bb.1
+
+  ; OPT: bb.0:
+  ; OPT: S_WAIT_DSCNT_soft 0
+  ; OPT-NEXT: S_BRANCH %bb.1
+
+  ; NOOPT: bb.0:
+  ; NOOPT-NOT: S_WAIT_DSCNT
+  ; NOOPT: S_BRANCH %bb.1
+
+  ; OPT: bb.1:
+  ; OPT: S_WAIT_DSCNT 12
+  ; OPT-NEXT: early-clobber $vgpr80{{.*}} = V_WMMA
+
+  ; NOOPT: bb.1:
+  ; NOOPT: S_WAIT_DSCNT 0
+  ; NOOPT-NEXT: early-clobber $vgpr80{{.*}} = V_WMMA
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $sgpr0, $vgpr0, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, $vgpr100
+
+    ; First WMMA uses vgpr10-25 (loads #1-4). Loads #1-2 are flushed by same-iter use.
+    ; Only loads #3-4 (now positions 1-2) are tracked. OptWait = 14 - 2 = 12
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, 8, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, 8, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, 8, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, 8, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, 8, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, 8, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+
+    S_BARRIER
+
+    ; Prefetch DS loads
+    $vgpr10_vgpr11_vgpr12_vgpr13 = DS_READ_B128 $vgpr0, 0, 0, implicit $m0, implicit $exec
+    $vgpr14_vgpr15_vgpr16_vgpr17 = DS_READ_B128 $vgpr0, 16, 0, implicit $m0, implicit $exec
+    $vgpr18_vgpr19_vgpr20_vgpr21 = DS_READ_B128 $vgpr0, 32, 0, implicit $m0, implicit $exec
+    $vgpr22_vgpr23_vgpr24_vgpr25 = DS_READ_B128 $vgpr0, 48, 0, implicit $m0, implicit $exec
+    $vgpr26_vgpr27_vgpr28_vgpr29 = DS_READ_B128 $vgpr0, 64, 0, implicit $m0, implicit $exec
+    $vgpr30_vgpr31_vgpr32_vgpr33 = DS_READ_B128 $vgpr0, 80, 0, implicit $m0, implicit $exec
+    $vgpr34_vgpr35_vgpr36_vgpr37 = DS_READ_B128 $vgpr0, 96, 0, implicit $m0, implicit $exec
+    $vgpr38_vgpr39_vgpr40_vgpr41 = DS_READ_B128 $vgpr0, 112, 0, implicit $m0, implicit $exec
+    $vgpr42_vgpr43_vgpr44_vgpr45 = DS_READ_B128 $vgpr0, 128, 0, implicit $m0, implicit $exec
+    $vgpr46_vgpr47_vgpr48_vgpr49 = DS_READ_B128 $vgpr0, 144, 0, implicit $m0, implicit $exec
+    $vgpr50_vgpr51_vgpr52_vgpr53 = DS_READ_B128 $vgpr0, 160, 0, implicit $m0, implicit $exec
+    $vgpr54_vgpr55_vgpr56_vgpr57 = DS_READ_B128 $vgpr0, 176, 0, implicit $m0, implicit $exec
+    $vgpr58_vgpr59_vgpr60_vgpr61 = DS_READ_B128 $vgpr0, 192, 0, implicit $m0, implicit $exec
+    $vgpr62_vgpr63_vgpr64_vgpr65 = DS_READ_B128 $vgpr0, 208, 0, implicit $m0, implicit $exec
+    $vgpr66_vgpr67_vgpr68_vgpr69 = DS_READ_B128 $vgpr0, 224, 0, implicit $m0, implicit $exec
+    $vgpr70_vgpr71_vgpr72_vgpr73 = DS_READ_B128 $vgpr0, 240, 0, implicit $m0, implicit $exec
+
+    ; Same-iteration USE of load #2 result - flushes loads #1-2
+    ; Remaining loads #3-16 (14 loads), WMMA uses loads #3-4 (positions 1-2)
+    ; OptWait = 14 - 2 = 12
+    $vgpr100 = V_MOV_B32_e32 $vgpr14, implicit $exec
+
+    $sgpr0 = S_ADD_I32 $sgpr0, -1, implicit-def $scc
+    S_CBRANCH_SCC1 %bb.1, implicit $scc
+    S_BRANCH %bb.2
+
+  bb.2:
+    S_ENDPGM 0
+
+---
+# Fourth test: same-iteration OVERWRITE of a DS load result (load #2 = vgpr14-17)
+# Same effect as use - flushes loads #1-2.
+# First WMMA uses loads #1-4 (vgpr10-25), but only loads #3-4 are tracked (positions 1-2).
+# OptWait = 14 - 2 = 12, which is 12 improvement from baseline 0 -> optimization kicks in!
+name: ds_loop_same_iter_overwrite
+tracksRegLiveness: true
+machineFunctionInfo:
+  isEntryFunction: true
+  waveLimiter: false
+body: |
+  ; OPT-LABEL: name: ds_loop_same_iter_overwrite
+  ; NOOPT-LABEL: name: ds_loop_same_iter_overwrite
+
+  ; OPT: bb.0:
+  ; OPT: S_WAIT_DSCNT_soft 0
+  ; OPT-NEXT: S_BRANCH %bb.1
+
+  ; NOOPT: bb.0:
+  ; NOOPT-NOT: S_WAIT_DSCNT
+  ; NOOPT: S_BRANCH %bb.1
+
+  bb.0:
+    successors: %bb.1
+    liveins: $sgpr0, $vgpr0
+
+    ; Preheader: DS loads in REVERSE order
+    $vgpr70_vgpr71_vgpr72_vgpr73 = DS_READ_B128 $vgpr0, 240, 0, implicit $m0, implicit $exec
+    $vgpr66_vgpr67_vgpr68_vgpr69 = DS_READ_B128 $vgpr0, 224, 0, implicit $m0, implicit $exec
+    $vgpr62_vgpr63_vgpr64_vgpr65 = DS_READ_B128 $vgpr0, 208, 0, implicit $m0, implicit $exec
+    $vgpr58_vgpr59_vgpr60_vgpr61 = DS_READ_B128 $vgpr0, 192, 0, implicit $m0, implicit $exec
+    $vgpr54_vgpr55_vgpr56_vgpr57 = DS_READ_B128 $vgpr0, 176, 0, implicit $m0, implicit $exec
+    $vgpr50_vgpr51_vgpr52_vgpr53 = DS_READ_B128 $vgpr0, 160, 0, implicit $m0, implicit $exec
+    $vgpr46_vgpr47_vgpr48_vgpr49 = DS_READ_B128 $vgpr0, 144, 0, implicit $m0, implicit $exec
+    $vgpr42_vgpr43_vgpr44_vgpr45 = DS_READ_B128 $vgpr0, 128, 0, implicit $m0, implicit $exec
+    $vgpr38_vgpr39_vgpr40_vgpr41 = DS_READ_B128 $vgpr0, 112, 0, implicit $m0, implicit $exec
+    $vgpr34_vgpr35_vgpr36_vgpr37 = DS_READ_B128 $vgpr0, 96, 0, implicit $m0, implicit $exec
+    $vgpr30_vgpr31_vgpr32_vgpr33 = DS_READ_B128 $vgpr0, 80, 0, implicit $m0, implicit $exec
+    $vgpr26_vgpr27_vgpr28_vgpr29 = DS_READ_B128 $vgpr0, 64, 0, implicit $m0, implicit $exec
+    $vgpr22_vgpr23_vgpr24_vgpr25 = DS_READ_B128 $vgpr0, 48, 0, implicit $m0, implicit $exec
+    $vgpr18_vgpr19_vgpr20_vgpr21 = DS_READ_B128 $vgpr0, 32, 0, implicit $m0, implicit $exec
+    $vgpr14_vgpr15_vgpr16_vgpr17 = DS_READ_B128 $vgpr0, 16, 0, implicit $m0, implicit $exec
+    $vgpr10_vgpr11_vgpr12_vgpr13 = DS_READ_B128 $vgpr0, 0, 0, implicit $m0, implicit $exec
+    S_BRANCH %bb.1
+
+  ; OPT: bb.1:
+  ; OPT: S_WAIT_DSCNT 12
+  ; OPT-NEXT: early-clobber $vgpr80{{.*}} = V_WMMA
+
+  ; NOOPT: bb.1:
+  ; NOOPT: S_WAIT_DSCNT 0
+  ; NOOPT-NEXT: early-clobber $vgpr80{{.*}} = V_WMMA
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $sgpr0, $vgpr0, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95
+
+    ; First WMMA uses vgpr10-25 (loads #1-4). Loads #1-2 are flushed by same-iter overwrite.
+    ; Only loads #3-4 (now positions 1-2) are tracked. OptWait = 14 - 2 = 12
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, 8, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, 8, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, 8, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, 8, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, 8, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, 8, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+
+    S_BARRIER
+
+    ; Prefetch DS loads
+    $vgpr10_vgpr11_vgpr12_vgpr13 = DS_READ_B128 $vgpr0, 0, 0, implicit $m0, implicit $exec
+    $vgpr14_vgpr15_vgpr16_vgpr17 = DS_READ_B128 $vgpr0, 16, 0, implicit $m0, implicit $exec
+    $vgpr18_vgpr19_vgpr20_vgpr21 = DS_READ_B128 $vgpr0, 32, 0, implicit $m0, implicit $exec
+    $vgpr22_vgpr23_vgpr24_vgpr25 = DS_READ_B128 $vgpr0, 48, 0, implicit $m0, implicit $exec
+    $vgpr26_vgpr27_vgpr28_vgpr29 = DS_READ_B128 $vgpr0, 64, 0, implicit $m0, implicit $exec
+    $vgpr30_vgpr31_vgpr32_vgpr33 = DS_READ_B128 $vgpr0, 80, 0, implicit $m0, implicit $exec
+    $vgpr34_vgpr35_vgpr36_vgpr37 = DS_READ_B128 $vgpr0, 96, 0, implicit $m0, implicit $exec
+    $vgpr38_vgpr39_vgpr40_vgpr41 = DS_READ_B128 $vgpr0, 112, 0, implicit $m0, implicit $exec
+    $vgpr42_vgpr43_vgpr44_vgpr45 = DS_READ_B128 $vgpr0, 128, 0, implicit $m0, implicit $exec
+    $vgpr46_vgpr47_vgpr48_vgpr49 = DS_READ_B128 $vgpr0, 144, 0, implicit $m0, implicit $exec
+    $vgpr50_vgpr51_vgpr52_vgpr53 = DS_READ_B128 $vgpr0, 160, 0, implicit $m0, implicit $exec
+    $vgpr54_vgpr55_vgpr56_vgpr57 = DS_READ_B128 $vgpr0, 176, 0, implicit $m0, implicit $exec
+    $vgpr58_vgpr59_vgpr60_vgpr61 = DS_READ_B128 $vgpr0, 192, 0, implicit $m0, implicit $exec
+    $vgpr62_vgpr63_vgpr64_vgpr65 = DS_READ_B128 $vgpr0, 208, 0, implicit $m0, implicit $exec
+    $vgpr66_vgpr67_vgpr68_vgpr69 = DS_READ_B128 $vgpr0, 224, 0, implicit $m0, implicit $exec
+    $vgpr70_vgpr71_vgpr72_vgpr73 = DS_READ_B128 $vgpr0, 240, 0, implicit $m0, implicit $exec
+
+    ; Same-iteration OVERWRITE of load #2 result - flushes loads #1-2
+    $vgpr14 = V_ADD_F32_e32 $vgpr14, $vgpr14, implicit $mode, implicit $exec
+
+    $sgpr0 = S_ADD_I32 $sgpr0, -1, implicit-def $scc
+    S_CBRANCH_SCC1 %bb.1, implicit $scc
+    S_BRANCH %bb.2
+
+  bb.2:
+    S_ENDPGM 0
+
+---
+# Fifth test: same-iteration USE of load #4 result (vgpr22) instead of load #2
+# This flushes loads #1-4, leaving loads #5-16 (12 loads) as prefetch.
+# First WMMA uses loads #1-4, but all are flushed (not tracked).
+# MaxLoadPosition = 0, OptWait = 12 - 0 = 12. Still exceeds threshold!
+name: ds_loop_same_iter_use_load4
+tracksRegLiveness: true
+machineFunctionInfo:
+  isEntryFunction: true
+  waveLimiter: false
+body: |
+  ; OPT-LABEL: name: ds_loop_same_iter_use_load4
+  ; NOOPT-LABEL: name: ds_loop_same_iter_use_load4
+
+  ; OPT: bb.0:
+  ; OPT: S_WAIT_DSCNT_soft 0
+  ; OPT-NEXT: S_BRANCH %bb.1
+
+  ; NOOPT: bb.0:
+  ; NOOPT-NOT: S_WAIT_DSCNT
+  ; NOOPT: S_BRANCH %bb.1
+
+  bb.0:
+    successors: %bb.1
+    liveins: $sgpr0, $vgpr0
+
+    ; Preheader: DS loads in REVERSE order
+    $vgpr70_vgpr71_vgpr72_vgpr73 = DS_READ_B128 $vgpr0, 240, 0, implicit $m0, implicit $exec
+    $vgpr66_vgpr67_vgpr68_vgpr69 = DS_READ_B128 $vgpr0, 224, 0, implicit $m0, implicit $exec
+    $vgpr62_vgpr63_vgpr64_vgpr65 = DS_READ_B128 $vgpr0, 208, 0, implicit $m0, implicit $exec
+    $vgpr58_vgpr59_vgpr60_vgpr61 = DS_READ_B128 $vgpr0, 192, 0, implicit $m0, implicit $exec
+    $vgpr54_vgpr55_vgpr56_vgpr57 = DS_READ_B128 $vgpr0, 176, 0, implicit $m0, implicit $exec
+    $vgpr50_vgpr51_vgpr52_vgpr53 = DS_READ_B128 $vgpr0, 160, 0, implicit $m0, implicit $exec
+    $vgpr46_vgpr47_vgpr48_vgpr49 = DS_READ_B128 $vgpr0, 144, 0, implicit $m0, implicit $exec
+    $vgpr42_vgpr43_vgpr44_vgpr45 = DS_READ_B128 $vgpr0, 128, 0, implicit $m0, implicit $exec
+    $vgpr38_vgpr39_vgpr40_vgpr41 = DS_READ_B128 $vgpr0, 112, 0, implicit $m0, implicit $exec
+    $vgpr34_vgpr35_vgpr36_vgpr37 = DS_READ_B128 $vgpr0, 96, 0, implicit $m0, implicit $exec
+    $vgpr30_vgpr31_vgpr32_vgpr33 = DS_READ_B128 $vgpr0, 80, 0, implicit $m0, implicit $exec
+    $vgpr26_vgpr27_vgpr28_vgpr29 = DS_READ_B128 $vgpr0, 64, 0, implicit $m0, implicit $exec
+    $vgpr22_vgpr23_vgpr24_vgpr25 = DS_READ_B128 $vgpr0, 48, 0, implicit $m0, implicit $exec
+    $vgpr18_vgpr19_vgpr20_vgpr21 = DS_READ_B128 $vgpr0, 32, 0, implicit $m0, implicit $exec
+    $vgpr14_vgpr15_vgpr16_vgpr17 = DS_READ_B128 $vgpr0, 16, 0, implicit $m0, implicit $exec
+    $vgpr10_vgpr11_vgpr12_vgpr13 = DS_READ_B128 $vgpr0, 0, 0, implicit $m0, implicit $exec
+    S_BRANCH %bb.1
+
+  ; OPT: bb.1:
+  ; OPT: S_WAIT_DSCNT 12
+  ; OPT-NEXT: early-clobber $vgpr80{{.*}} = V_WMMA
+
+  ; NOOPT: bb.1:
+  ; NOOPT: S_WAIT_DSCNT 0
+  ; NOOPT-NEXT: early-clobber $vgpr80{{.*}} = V_WMMA
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $sgpr0, $vgpr0, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, $vgpr100
+
+    ; First WMMA uses vgpr10-25 (loads #1-4). All loads #1-4 are flushed by same-iter use.
+    ; None of the WMMA operands are tracked. MaxLoadPosition = 0, OptWait = 12 - 0 = 12
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, 8, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, 8, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, 8, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, 8, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, 8, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, 8, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+
+    S_BARRIER
+
+    ; Prefetch DS loads
+    $vgpr10_vgpr11_vgpr12_vgpr13 = DS_READ_B128 $vgpr0, 0, 0, implicit $m0, implicit $exec
+    $vgpr14_vgpr15_vgpr16_vgpr17 = DS_READ_B128 $vgpr0, 16, 0, implicit $m0, implicit $exec
+    $vgpr18_vgpr19_vgpr20_vgpr21 = DS_READ_B128 $vgpr0, 32, 0, implicit $m0, implicit $exec
+    $vgpr22_vgpr23_vgpr24_vgpr25 = DS_READ_B128 $vgpr0, 48, 0, implicit $m0, implicit $exec
+    $vgpr26_vgpr27_vgpr28_vgpr29 = DS_READ_B128 $vgpr0, 64, 0, implicit $m0, implicit $exec
+    $vgpr30_vgpr31_vgpr32_vgpr33 = DS_READ_B128 $vgpr0, 80, 0, implicit $m0, implicit $exec
+    $vgpr34_vgpr35_vgpr36_vgpr37 = DS_READ_B128 $vgpr0, 96, 0, implicit $m0, implicit $exec
+    $vgpr38_vgpr39_vgpr40_vgpr41 = DS_READ_B128 $vgpr0, 112, 0, implicit $m0, implicit $exec
+    $vgpr42_vgpr43_vgpr44_vgpr45 = DS_READ_B128 $vgpr0, 128, 0, implicit $m0, implicit $exec
+    $vgpr46_vgpr47_vgpr48_vgpr49 = DS_READ_B128 $vgpr0, 144, 0, implicit $m0, implicit $exec
+    $vgpr50_vgpr51_vgpr52_vgpr53 = DS_READ_B128 $vgpr0, 160, 0, implicit $m0, implicit $exec
+    $vgpr54_vgpr55_vgpr56_vgpr57 = DS_READ_B128 $vgpr0, 176, 0, implicit $m0, implicit $exec
+    $vgpr58_vgpr59_vgpr60_vgpr61 = DS_READ_B128 $vgpr0, 192, 0, implicit $m0, implicit $exec
+    $vgpr62_vgpr63_vgpr64_vgpr65 = DS_READ_B128 $vgpr0, 208, 0, implicit $m0, implicit $exec
+    $vgpr66_vgpr67_vgpr68_vgpr69 = DS_READ_B128 $vgpr0, 224, 0, implicit $m0, implicit $exec
+    $vgpr70_vgpr71_vgpr72_vgpr73 = DS_READ_B128 $vgpr0, 240, 0, implicit $m0, implicit $exec
+
+    ; Same-iteration USE of load #4 result - flushes loads #1-4
+    $vgpr100 = V_MOV_B32_e32 $vgpr22, implicit $exec
+
+    $sgpr0 = S_ADD_I32 $sgpr0, -1, implicit-def $scc
+    S_CBRANCH_SCC1 %bb.1, implicit $scc
+    S_BRANCH %bb.2
+
+  bb.2:
+    S_ENDPGM 0
+
+---
+# Sixth test: TENSOR_LOAD_TO_LDS after barrier - optimization must bail out
+# Both OPT and NOOPT should produce the same (conservative) wait count.
+name: ds_loop_tensor_load
+tracksRegLiveness: true
+machineFunctionInfo:
+  isEntryFunction: true
+  waveLimiter: false
+body: |
+  ; OPT-LABEL: name: ds_loop_tensor_load
+  ; NOOPT-LABEL: name: ds_loop_tensor_load
+
+  bb.0:
+    successors: %bb.1
+    liveins: $sgpr0, $vgpr0, $sgpr4_sgpr5_sgpr6_sgpr7, $sgpr8_sgpr9_sgpr10_sgpr11_sgpr12_sgpr13_sgpr14_sgpr15, $sgpr16_sgpr17_sgpr18_sgpr19, $sgpr20_sgpr21_sgpr22_sgpr23
+
+    ; Preheader: DS loads in REVERSE order
+    $vgpr70_vgpr71_vgpr72_vgpr73 = DS_READ_B128 $vgpr0, 240, 0, implicit $m0, implicit $exec
+    $vgpr66_vgpr67_vgpr68_vgpr69 = DS_READ_B128 $vgpr0, 224, 0, implicit $m0, implicit $exec
+    $vgpr62_vgpr63_vgpr64_vgpr65 = DS_READ_B128 $vgpr0, 208, 0, implicit $m0, implicit $exec
+    $vgpr58_vgpr59_vgpr60_vgpr61 = DS_READ_B128 $vgpr0, 192, 0, implicit $m0, implicit $exec
+    $vgpr54_vgpr55_vgpr56_vgpr57 = DS_READ_B128 $vgpr0, 176, 0, implicit $m0, implicit $exec
+    $vgpr50_vgpr51_vgpr52_vgpr53 = DS_READ_B128 $vgpr0, 160, 0, implicit $m0, implicit $exec
+    $vgpr46_vgpr47_vgpr48_vgpr49 = DS_READ_B128 $vgpr0, 144, 0, implicit $m0, implicit $exec
+    $vgpr42_vgpr43_vgpr44_vgpr45 = DS_READ_B128 $vgpr0, 128, 0, implicit $m0, implicit $exec
+    $vgpr38_vgpr39_vgpr40_vgpr41 = DS_READ_B128 $vgpr0, 112, 0, implicit $m0, implicit $exec
+    $vgpr34_vgpr35_vgpr36_vgpr37 = DS_READ_B128 $vgpr0, 96, 0, implicit $m0, implicit $exec
+    $vgpr30_vgpr31_vgpr32_vgpr33 = DS_READ_B128 $vgpr0, 80, 0, implicit $m0, implicit $exec
+    $vgpr26_vgpr27_vgpr28_vgpr29 = DS_READ_B128 $vgpr0, 64, 0, implicit $m0, implicit $exec
+    $vgpr22_vgpr23_vgpr24_vgpr25 = DS_READ_B128 $vgpr0, 48, 0, implicit $m0, implicit $exec
+    $vgpr18_vgpr19_vgpr20_vgpr21 = DS_READ_B128 $vgpr0, 32, 0, implicit $m0, implicit $exec
+    $vgpr14_vgpr15_vgpr16_vgpr17 = DS_READ_B128 $vgpr0, 16, 0, implicit $m0, implicit $exec
+    $vgpr10_vgpr11_vgpr12_vgpr13 = DS_READ_B128 $vgpr0, 0, 0, implicit $m0, implicit $exec
+    S_BRANCH %bb.1
+
+  ; tensor_load_to_lds after barrier causes optimization to bail out.
+  ; Both OPT and NOOPT produce the same conservative wait.
+  ; OPT: bb.1:
+  ; OPT: S_WAIT_DSCNT 0
+  ; OPT: early-clobber $vgpr80{{.*}} = V_WMMA
+
+  ; NOOPT: bb.1:
+  ; NOOPT: S_WAIT_DSCNT 0
+  ; NOOPT: early-clobber $vgpr80{{.*}} = V_WMMA
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $sgpr0, $vgpr0, $sgpr4_sgpr5_sgpr6_sgpr7, $sgpr8_sgpr9_sgpr10_sgpr11_sgpr12_sgpr13_sgpr14_sgpr15, $sgpr16_sgpr17_sgpr18_sgpr19, $sgpr20_sgpr21_sgpr22_sgpr23, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95
+
+    ; First WMMA uses vgpr10-25 (loads #1-4)
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, 8, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, 8, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, 8, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr10_vgpr11_vgpr12_vgpr13_vgpr14_vgpr15_vgpr16_vgpr17, 8, $vgpr18_vgpr19_vgpr20_vgpr21_vgpr22_vgpr23_vgpr24_vgpr25, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr26_vgpr27_vgpr28_vgpr29_vgpr30_vgpr31_vgpr32_vgpr33, 8, $vgpr34_vgpr35_vgpr36_vgpr37_vgpr38_vgpr39_vgpr40_vgpr41, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr42_vgpr43_vgpr44_vgpr45_vgpr46_vgpr47_vgpr48_vgpr49, 8, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57, 8, killed $vgpr80_vgpr81_vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87, 0, 0, 0, 0, implicit $exec
+    early-clobber $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95 = V_WMMA_F32_16X16X32_F16_w32_twoaddr 8, $vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73, 8, killed $vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95, 0, 0, 0, 0, implicit $exec
+
+    S_BARRIER
+
+    ; TENSOR_LOAD_TO_LDS after barrier - causes optimization to bail out
+    TENSOR_LOAD_TO_LDS $sgpr4_sgpr5_sgpr6_sgpr7, $sgpr8_sgpr9_sgpr10_sgpr11_sgpr12_sgpr13_sgpr14_sgpr15, $sgpr16_sgpr17_sgpr18_sgpr19, $sgpr20_sgpr21_sgpr22_sgpr23, 0, 0, implicit $exec, implicit $tensorcnt, implicit-def $tensorcnt
+
+    ; Prefetch DS loads
+    $vgpr10_vgpr11_vgpr12_vgpr13 = DS_READ_B128 $vgpr0, 0, 0, implicit $m0, implicit $exec
+    $vgpr14_vgpr15_vgpr16_vgpr17 = DS_READ_B128 $vgpr0, 16, 0, implicit $m0, implicit $exec
+    $vgpr18_vgpr19_vgpr20_vgpr21 = DS_READ_B128 $vgpr0, 32, 0, implicit $m0, implicit $exec
+    $vgpr22_vgpr23_vgpr24_vgpr25 = DS_READ_B128 $vgpr0, 48, 0, implicit $m0, implicit $exec
+    $vgpr26_vgpr27_vgpr28_vgpr29 = DS_READ_B128 $vgpr0, 64, 0, implicit $m0, implicit $exec
+    $vgpr30_vgpr31_vgpr32_vgpr33 = DS_READ_B128 $vgpr0, 80, 0, implicit $m0, implicit $exec
+    $vgpr34_vgpr35_vgpr36_vgpr37 = DS_READ_B128 $vgpr0, 96, 0, implicit $m0, implicit $exec
+    $vgpr38_vgpr39_vgpr40_vgpr41 = DS_READ_B128 $vgpr0, 112, 0, implicit $m0, implicit $exec
+    $vgpr42_vgpr43_vgpr44_vgpr45 = DS_READ_B128 $vgpr0, 128, 0, implicit $m0, implicit $exec
+    $vgpr46_vgpr47_vgpr48_vgpr49 = DS_READ_B128 $vgpr0, 144, 0, implicit $m0, implicit $exec
+    $vgpr50_vgpr51_vgpr52_vgpr53 = DS_READ_B128 $vgpr0, 160, 0, implicit $m0, implicit $exec
+    $vgpr54_vgpr55_vgpr56_vgpr57 = DS_READ_B128 $vgpr0, 176, 0, implicit $m0, implicit $exec
+    $vgpr58_vgpr59_vgpr60_vgpr61 = DS_READ_B128 $vgpr0, 192, 0, implicit $m0, implicit $exec
+    $vgpr62_vgpr63_vgpr64_vgpr65 = DS_READ_B128 $vgpr0, 208, 0, implicit $m0, implicit $exec
+    $vgpr66_vgpr67_vgpr68_vgpr69 = DS_READ_B128 $vgpr0, 224, 0, implicit $m0, implicit $exec
+    $vgpr70_vgpr71_vgpr72_vgpr73 = DS_READ_B128 $vgpr0, 240, 0, implicit $m0, implicit $exec
+
+    $sgpr0 = S_ADD_I32 $sgpr0, -1, implicit-def $scc
+    S_CBRANCH_SCC1 %bb.1, implicit $scc
+    S_BRANCH %bb.2
+
+  bb.2:
+    S_ENDPGM 0
+...

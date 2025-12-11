@@ -63,6 +63,12 @@ static cl::opt<bool> ForceEmitZeroLoadFlag(
     cl::desc("Force all waitcnt load counters to wait until 0"),
     cl::init(false), cl::Hidden);
 
+static cl::opt<bool> OptimizeDSLoopWaitcnt(
+    "amdgpu-waitcnt-loop-ds-opt",
+    cl::desc(
+        "Optimize DS wait counts in single-block loops with WMMA (GFX12+)"),
+    cl::init(false), cl::Hidden);
+
 namespace {
 // Class of object that encapsulates latest instruction counter score
 // associated with the operand.  Used for determining whether
@@ -448,6 +454,30 @@ private:
   // message.
   DenseSet<MachineInstr *> ReleaseVGPRInsts;
 
+  // Single-block loop DS wait optimization (GFX12+)
+  // This optimization relaxes DS wait counts in loops with many DS loads and
+  // WMMA instructions, allowing more overlap between memory and compute.
+  struct LoopDSWaitOptInfo {
+    // Maps VGPR number to the position (1-based) of the DS load that writes it.
+    // Position 1 = first DS load in sequence, etc.
+    DenseMap<unsigned, unsigned> VGPRToLoadPosition;
+    unsigned TotalDSLoads = 0;
+    bool Valid = false;
+    // Set to true when relaxation is actually applied in the loop body.
+    // Used to determine if preheader needs DS_CNT flush.
+    mutable bool RelaxationApplied = false;
+    // Pointer to the last barrier in the loop (found during eligibility check)
+    const MachineInstr *LastBarrier = nullptr;
+    // The wait count "floor" established by same-iteration uses/overwrites.
+    // When a DS load result is used in the same iteration, the baseline inserts
+    // a wait. This floor indicates the expected counter state after that wait.
+    // WMMAs that only use flushed loads can rely on this floor.
+    unsigned FloorWaitCount = 0;
+  };
+
+  // Cache of loop DS wait optimization info, keyed by loop header MBB.
+  DenseMap<MachineBasicBlock *, LoopDSWaitOptInfo> LoopDSWaitOptCache;
+
   HardwareLimits Limits;
 
 public:
@@ -573,6 +603,14 @@ public:
                              WaitcntBrackets &ScoreBrackets);
   bool insertWaitcntInBlock(MachineFunction &MF, MachineBasicBlock &Block,
                             WaitcntBrackets &ScoreBrackets);
+
+  // DS loop wait optimization functions
+  bool isEligibleForDSLoopOpt(MachineLoop *ML, LoopDSWaitOptInfo &Info) const;
+  void analyzeSingleBBLoopDSLoads(MachineLoop *ML);
+  std::optional<unsigned> getOptimalDSWaitCount(MachineBasicBlock *LoopHeader,
+                                                const MachineInstr &MI) const;
+  bool applyDSLoopWaitOpt(MachineInstr &MI, AMDGPU::Waitcnt &Wait);
+  bool insertDSPreheaderFlushes(MachineFunction &MF);
 };
 
 // This objects maintains the current score brackets of each wait counter, and
@@ -2111,6 +2149,10 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(MachineInstr &MI,
   // Verify that the wait is actually needed.
   ScoreBrackets.simplifyWaitcnt(Wait);
 
+  // DS Loop Wait Optimization (GFX12+):
+  // Try to relax conservative DS wait counts in single-block loops with WMMA.
+  applyDSLoopWaitOpt(MI, Wait);
+
   // Since the translation for VMEM addresses occur in-order, we can apply the
   // XCnt if the current instruction is of VMEM type and has a memory
   // dependency with another VMEM instruction in flight.
@@ -2643,6 +2685,375 @@ bool SIInsertWaitcnts::isVMEMOrFlatVMEM(const MachineInstr &MI) const {
   return SIInstrInfo::isVMEM(MI);
 }
 
+//===----------------------------------------------------------------------===//
+// DS Loop Wait Optimization (GFX12+)
+//
+// This optimization relaxes DS wait counts in single-block loops that have
+// many DS loads and WMMA/MFMA instructions (typical GEMM kernels with software
+// pipelining). Instead of waiting for almost all DS loads to complete before
+// each WMMA, we analyze which specific loads feed each WMMA and wait only for
+// those to complete, allowing more overlap between memory and compute.
+//
+// Opportunity arises when the load ordering in the preheader block and
+// the load ordering at the end of the loop body, feeding the loaded data
+// to the next iteration, are not matched well (since their orderings are
+// not co-optimized)
+//===----------------------------------------------------------------------===//
+
+bool SIInsertWaitcnts::isEligibleForDSLoopOpt(MachineLoop *ML,
+                                              LoopDSWaitOptInfo &Info) const {
+  if (!OptimizeDSLoopWaitcnt)
+    return false;
+
+  // Only for GFX12+ where we have a separate counter for LDS.
+  if (!ST->hasExtendedWaitCounts())
+    return false;
+
+  // Must be a single-block loop. Makes the analysis easier.
+  if (ML->getNumBlocks() != 1)
+    return false;
+
+  MachineBasicBlock *MBB = ML->getHeader();
+
+  // Count DS loads, WMMA/MFMA instructions, and total non-meta instructions
+  // Also find the last barrier during this traversal to avoid re-traversing
+  unsigned NumDSLoads = 0;
+  unsigned NumWMMA = 0;
+  unsigned NumInsts = 0;
+  Info.LastBarrier = nullptr;
+
+  for (const MachineInstr &MI : *MBB) {
+    if (!MI.isMetaInstruction())
+      ++NumInsts;
+
+    if (SIInstrInfo::isDS(MI)) {
+      if (MI.mayLoad() && !MI.mayStore())
+        ++NumDSLoads;
+    } else if (SIInstrInfo::isWMMA(MI) || SIInstrInfo::isMFMA(MI)) {
+      ++NumWMMA;
+    }
+
+    // Track the last barrier instruction
+    if (MI.getOpcode() == AMDGPU::S_BARRIER ||
+        MI.getOpcode() == AMDGPU::S_BARRIER_SIGNAL_IMM ||
+        MI.getOpcode() == AMDGPU::S_BARRIER_SIGNAL_ISFIRST_IMM) {
+      Info.LastBarrier = &MI;
+    }
+  }
+
+  // Heuristics: need significant number of DS loads and WMMA/MFMA
+  // to make this optimization worthwhile
+  if (NumDSLoads < 16 || NumWMMA < 8)
+    return false;
+
+  // DS loads and WMMAs should be a significant portion of the loop body
+  // (at least 1/4 of the instructions)
+  if ((NumDSLoads + NumWMMA) * 4 < NumInsts)
+    return false;
+
+  LLVM_DEBUG(dbgs() << "Loop DS Wait Opt: Loop at "; MBB->printName(dbgs());
+             dbgs() << " - " << NumDSLoads << " DS loads, " << NumWMMA
+                    << " WMMA/MFMA, " << NumInsts
+                    << " total insts, eligible\n");
+
+  return true;
+}
+
+void SIInsertWaitcnts::analyzeSingleBBLoopDSLoads(MachineLoop *ML) {
+  MachineBasicBlock *MBB = ML->getHeader();
+  LoopDSWaitOptInfo &Info = LoopDSWaitOptCache[MBB];
+
+  // Quick structural checks
+  if (!isEligibleForDSLoopOpt(ML, Info)) {
+    Info.Valid = false;
+    return;
+  }
+
+  // Looking for something similar to software-pipelined GEMM loops,
+  // where the last part of the loop body is prefetching data for the next
+  // iteration. Such code also has loads in the preheader block whose ordering
+  // may be significantly different from the load ordering at the end of the
+  // loop body since their orderings are not co-optimized. That can end up in
+  // rather conservative LDS wait counts.
+
+  // We only care about the LDS loads after the last barrier in the loop body,
+  // if one exists. LastBarrier was already found during eligibility check.
+  // These are likely to be prefetch loads whose results are used in the next
+  // iteration.
+  //
+  // If a load result is used or overwritten within the same iteration, the
+  // baseline will insert a wait before that instruction. Since DS loads
+  // complete in FIFO order, that wait also completes all earlier loads. So we
+  // can drop those "flushed" loads from our tracking and only consider
+  // subsequent loads as true prefetch loads. Overwrites also require the load
+  // to complete first to avoid write-after-write races.
+  const MachineInstr *LastBarrier = Info.LastBarrier;
+
+  // Single pass: track DS load destinations, handle uses (which flush prior
+  // loads) and detect overwrites (which invalidate our analysis).
+  // TrackedLoads: (Register, Position) pairs for checking uses/overwrites
+  SmallVector<std::pair<Register, unsigned>, 64> TrackedLoads;
+  unsigned LoadPosition = 0;
+  unsigned LastFlushedPosition = 0; // Loads up to this position will be flushed
+  bool AfterLastBarrier = (LastBarrier == nullptr); // If no barrier, track all
+
+  for (const MachineInstr &MI : *MBB) {
+    if (&MI == LastBarrier) {
+      AfterLastBarrier = true;
+      continue;
+    }
+
+    if (!AfterLastBarrier)
+      continue;
+
+    // Check for instructions that write to LDS through DMA (global_load_lds,
+    // etc). These write to LDS but aren't DS instructions.
+    // Bail out if any appear after the barrier.
+    if (SIInstrInfo::mayWriteLDSThroughDMA(MI)) {
+      LLVM_DEBUG(
+          dbgs() << "Loop DS Wait Opt: LDS DMA write after last barrier, "
+                 << "skipping\n");
+      Info.Valid = false;
+      return;
+    }
+
+    // Check for tensor_load_to_lds instructions (MIMG, not caught by above)
+    if (MI.getOpcode() == AMDGPU::TENSOR_LOAD_TO_LDS ||
+        MI.getOpcode() == AMDGPU::TENSOR_LOAD_TO_LDS_D2) {
+      LLVM_DEBUG(dbgs() << "Loop DS Wait Opt: tensor_load_to_lds after last "
+                        << "barrier, skipping\n");
+      Info.Valid = false;
+      return;
+    }
+
+    // Check if this instruction uses or overwrites any tracked DS load
+    // destination. If so, baseline will have inserted a wait that flushes
+    // all loads up to that position (since DS loads complete in order).
+    // Overwrites also require the load to complete first to avoid races.
+    for (auto &[Reg, Position] : TrackedLoads) {
+      if (Position <= LastFlushedPosition)
+        continue; // Already flushed
+
+      if (MI.readsRegister(Reg, TRI) || MI.modifiesRegister(Reg, TRI)) {
+        LLVM_DEBUG(dbgs() << "Loop DS Wait Opt: DS load at position "
+                          << Position << " used/overwritten in same iteration, "
+                          << "flushing positions 1-" << Position << "\n");
+        LastFlushedPosition = std::max(LastFlushedPosition, Position);
+      }
+    }
+
+    // Check DS instructions
+    if (SIInstrInfo::isDS(MI)) {
+      // DS stores after barrier not allowed - same counter, may complete
+      // out of order with loads
+      if (MI.mayStore()) {
+        LLVM_DEBUG(dbgs() << "Loop DS Wait Opt: DS store after last barrier, "
+                          << "skipping\n");
+        Info.Valid = false;
+        return;
+      }
+
+      // Track DS loads - record position
+      if (MI.mayLoad()) {
+        ++LoadPosition;
+        for (const MachineOperand &Op : MI.defs()) {
+          if (Op.isReg() && Op.getReg().isPhysical() &&
+              TRI->isVGPR(*MRI, Op.getReg())) {
+            TrackedLoads.emplace_back(Op.getReg(), LoadPosition);
+            for (MCRegUnit Unit : TRI->regunits(Op.getReg())) {
+              Info.VGPRToLoadPosition[static_cast<unsigned>(Unit)] =
+                  LoadPosition;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Filter out flushed loads and renumber remaining ones
+  // Also compute the floor wait count - the wait established by same-iteration
+  // use
+  if (LastFlushedPosition > 0) {
+    DenseMap<unsigned, unsigned> NewMap;
+    for (auto &[RegUnit, Position] : Info.VGPRToLoadPosition) {
+      if (Position > LastFlushedPosition) {
+        NewMap[RegUnit] = Position - LastFlushedPosition;
+      }
+    }
+    Info.VGPRToLoadPosition = std::move(NewMap);
+    // FloorWaitCount: when same-iteration use waits for load N, it leaves
+    // (TotalLoads - N) loads in flight. For the next iteration's WMMAs,
+    // any that only use flushed loads are already covered by this wait.
+    Info.FloorWaitCount = LoadPosition - LastFlushedPosition;
+  } else {
+    Info.FloorWaitCount = 0;
+  }
+
+  Info.TotalDSLoads = LoadPosition - LastFlushedPosition;
+  Info.Valid = Info.TotalDSLoads > 0;
+
+  LLVM_DEBUG(dbgs() << "Loop DS Wait Opt: Analyzed loop at ";
+             MBB->printName(dbgs());
+             dbgs() << " - " << Info.TotalDSLoads << " DS loads, "
+                    << "FloorWaitCount=" << Info.FloorWaitCount
+                    << ", HasBarrier=" << (LastBarrier != nullptr)
+                    << ", Valid=" << Info.Valid << "\n");
+}
+
+std::optional<unsigned>
+SIInsertWaitcnts::getOptimalDSWaitCount(MachineBasicBlock *LoopHeader,
+                                        const MachineInstr &MI) const {
+  auto It = LoopDSWaitOptCache.find(LoopHeader);
+  if (It == LoopDSWaitOptCache.end() || !It->second.Valid)
+    return std::nullopt;
+
+  const LoopDSWaitOptInfo &Info = It->second;
+
+  // Find the maximum load position among all VGPR operands used by MI
+  unsigned MaxLoadPosition = 0;
+  for (const MachineOperand &Op : MI.operands()) {
+    if (!Op.isReg() || !Op.isUse() || !Op.getReg().isPhysical())
+      continue;
+    if (!TRI->isVGPR(*MRI, Op.getReg()))
+      continue;
+
+    for (MCRegUnit Unit : TRI->regunits(Op.getReg())) {
+      auto PosIt = Info.VGPRToLoadPosition.find(static_cast<unsigned>(Unit));
+      if (PosIt != Info.VGPRToLoadPosition.end()) {
+        MaxLoadPosition = std::max(MaxLoadPosition, PosIt->second);
+      }
+    }
+  }
+
+  // Optimal wait = TotalDSLoads - MaxLoadPosition
+  // This means we wait until all loads up to and including MaxLoadPosition
+  // have completed, but loads after it can still be in flight.
+  unsigned OptimalWait = Info.TotalDSLoads - MaxLoadPosition;
+
+  // If MaxLoadPosition == 0, this instruction only uses flushed loads
+  // (whose results are used in the same iteration). The same-iteration use
+  // will insert a wait that leaves FloorWaitCount loads in flight.
+  // So this instruction's needs are covered if OptimalWait >= FloorWaitCount.
+  // We return FloorWaitCount to indicate "can relax to this level".
+  if (MaxLoadPosition == 0 && Info.FloorWaitCount > 0) {
+    // All operands are from flushed loads - covered by same-iteration use's
+    // wait
+    return Info.FloorWaitCount;
+  }
+
+  if (MaxLoadPosition == 0)
+    return std::nullopt;
+
+  return OptimalWait;
+}
+
+// Try to apply DS loop wait optimization to relax conservative wait counts.
+// Returns true if the wait count was modified.
+bool SIInsertWaitcnts::applyDSLoopWaitOpt(MachineInstr &MI,
+                                          AMDGPU::Waitcnt &Wait) {
+  // Only applies to GFX12+ with separate DS counter
+  if (!ST->hasExtendedWaitCounts())
+    return false;
+
+  // Only optimize if baseline wants a DS wait
+  if (Wait.DsCnt == ~0u)
+    return false;
+
+  MachineBasicBlock *MBB = MI.getParent();
+  MachineLoop *ML = MLI->getLoopFor(MBB);
+
+  // Only apply in loop headers
+  if (!ML || ML->getHeader() != MBB)
+    return false;
+
+  auto CacheIt = LoopDSWaitOptCache.find(MBB);
+  if (CacheIt == LoopDSWaitOptCache.end() || !CacheIt->second.Valid)
+    return false;
+
+  // Only optimize if wait is conservative (less than half of loads in flight)
+  unsigned HalfLoads = CacheIt->second.TotalDSLoads / 2;
+  if (Wait.DsCnt >= HalfLoads)
+    return false;
+
+  auto OptWait = getOptimalDSWaitCount(MBB, MI);
+  if (!OptWait)
+    return false;
+
+  // Only relax the wait (increase the count), never tighten it
+  // and only when the relaxation is significant (at least 4 more)
+  if (*OptWait <= Wait.DsCnt || (*OptWait - Wait.DsCnt) < 4)
+    return false;
+
+  LLVM_DEBUG(dbgs() << "DS Loop Opt: Relaxing DsCnt from " << Wait.DsCnt
+                    << " to " << *OptWait << " for: " << MI);
+  Wait.DsCnt = *OptWait;
+  // Mark that relaxation was applied so preheader flush is inserted
+  CacheIt->second.RelaxationApplied = true;
+  return true;
+}
+
+// Insert DS_CNT flush in preheaders of loops where DS wait relaxation was
+// applied. This is necessary because the relaxed wait counts inside the loop
+// are computed based on the DS loads issued at the end of the previous
+// iteration (via backedge), but the first iteration enters via the preheader.
+// We must ensure all DS loads from the preheader are complete before entering
+// the loop.
+bool SIInsertWaitcnts::insertDSPreheaderFlushes(MachineFunction &MF) {
+  bool Modified = false;
+
+  for (auto &[LoopHeader, Info] : LoopDSWaitOptCache) {
+    if (!Info.Valid || !Info.RelaxationApplied)
+      continue;
+
+    MachineLoop *ML = MLI->getLoopFor(LoopHeader);
+    if (!ML)
+      continue;
+
+    MachineBasicBlock *Preheader = ML->getLoopPreheader();
+    if (!Preheader)
+      continue;
+
+    // Insert s_wait_dscnt 0 at the end of the preheader (before the terminator)
+    MachineBasicBlock::iterator InsertPos = Preheader->getFirstTerminator();
+    if (InsertPos == Preheader->end() && !Preheader->empty())
+      InsertPos = std::prev(Preheader->end());
+
+    // Check if there's already a DS wait at this position
+    bool NeedInsert = true;
+    if (InsertPos != Preheader->end() && InsertPos != Preheader->begin()) {
+      auto CheckPos = std::prev(InsertPos);
+      if (CheckPos->getOpcode() == AMDGPU::S_WAIT_DSCNT_soft ||
+          CheckPos->getOpcode() == AMDGPU::S_WAIT_DSCNT) {
+        if (CheckPos->getOperand(0).getImm() == 0)
+          NeedInsert = false;
+        else {
+          // Change existing wait to 0
+          CheckPos->getOperand(0).setImm(0);
+          NeedInsert = false;
+          Modified = true;
+          LLVM_DEBUG(dbgs() << "DS Loop Opt: Changed existing DS_CNT wait to 0"
+                            << " in preheader ";
+                     Preheader->printName(dbgs()); dbgs() << "\n");
+        }
+      }
+    }
+
+    if (NeedInsert) {
+      DebugLoc DL;
+      if (InsertPos != Preheader->end())
+        DL = InsertPos->getDebugLoc();
+      BuildMI(*Preheader, InsertPos, DL, TII->get(AMDGPU::S_WAIT_DSCNT_soft))
+          .addImm(0);
+      Modified = true;
+      LLVM_DEBUG(dbgs() << "DS Loop Opt: Inserted DS_CNT flush in preheader ";
+                 Preheader->printName(dbgs()); dbgs() << " for loop at ";
+                 LoopHeader->printName(dbgs()); dbgs() << "\n");
+    }
+  }
+
+  return Modified;
+}
+
 // Return true if it is better to flush the vmcnt counter in the preheader of
 // the given loop. We currently decide to flush in two situations:
 // 1. The loop contains vmem store(s), no vmem load and at least one use of a
@@ -2786,6 +3197,23 @@ bool SIInsertWaitcnts::run(MachineFunction &MF) {
   assert(NumSGPRsMax <= SQ_MAX_PGM_SGPRS);
 
   BlockInfos.clear();
+  LoopDSWaitOptCache.clear();
+
+  // Analyze single-block loops for single block loop DS wait optimization
+  // (GFX12+)
+  if (OptimizeDSLoopWaitcnt && ST->hasExtendedWaitCounts()) {
+    SmallVector<MachineLoop *, 4> Worklist(MLI->begin(), MLI->end());
+    while (!Worklist.empty()) {
+      MachineLoop *ML = Worklist.pop_back_val();
+      auto BeginIt = ML->getSubLoops().begin();
+      auto EndIt = ML->getSubLoops().end();
+      if (BeginIt == EndIt) // innermost loop only
+        analyzeSingleBBLoopDSLoads(ML);
+      else
+        Worklist.append(BeginIt, EndIt);
+    }
+  }
+
   bool Modified = false;
 
   MachineBasicBlock &EntryBB = MF.front();
@@ -2973,8 +3401,12 @@ bool SIInsertWaitcnts::run(MachineFunction &MF) {
       }
     }
   }
+  // Insert DS_CNT flushes in preheaders of loops that had wait counts relaxed.
+  Modified |= insertDSPreheaderFlushes(MF);
+
   ReleaseVGPRInsts.clear();
   PreheadersToFlush.clear();
+  LoopDSWaitOptCache.clear();
   SLoadAddresses.clear();
 
   return Modified;
