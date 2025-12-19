@@ -419,6 +419,12 @@ public:
   AMDGPU::Waitcnt getAllZeroWaitcnt(bool IncludeVSCnt) const override;
 };
 
+// Flags indicating which counters should be flushed in a loop preheader.
+struct PreheaderFlushFlags {
+  bool FlushVmCnt = false;
+  bool FlushDsCnt = false;
+};
+
 class SIInsertWaitcnts {
 public:
   const GCNSubtarget *ST;
@@ -431,7 +437,7 @@ public:
 
 private:
   DenseMap<const Value *, MachineBasicBlock *> SLoadAddresses;
-  DenseMap<MachineBasicBlock *, bool> PreheadersToFlush;
+  DenseMap<MachineBasicBlock *, PreheaderFlushFlags> PreheadersToFlush;
   MachineLoopInfo *MLI;
   MachinePostDominatorTree *PDT;
   AliasAnalysis *AA = nullptr;
@@ -492,10 +498,13 @@ public:
     return 0;
   }
 
-  bool shouldFlushVmCnt(MachineLoop *ML, const WaitcntBrackets &Brackets);
-  bool isPreheaderToFlush(MachineBasicBlock &MBB,
-                          const WaitcntBrackets &ScoreBrackets);
+  PreheaderFlushFlags getPreheaderFlushFlags(MachineLoop *ML,
+                                             const WaitcntBrackets &Brackets);
+  PreheaderFlushFlags isPreheaderToFlush(MachineBasicBlock &MBB,
+                                         const WaitcntBrackets &ScoreBrackets);
   bool isVMEMOrFlatVMEM(const MachineInstr &MI) const;
+  bool isDSRead(const MachineInstr &MI) const;
+  bool mayStoreLDS(const MachineInstr &MI) const;
   bool run(MachineFunction &MF);
 
   void setForceEmitWaitcnt() {
@@ -570,7 +579,7 @@ public:
   bool generateWaitcntInstBefore(MachineInstr &MI,
                                  WaitcntBrackets &ScoreBrackets,
                                  MachineInstr *OldWaitcntInstr,
-                                 bool FlushVmCnt);
+                                 PreheaderFlushFlags FlushFlags);
   bool generateWaitcnt(AMDGPU::Waitcnt Wait,
                        MachineBasicBlock::instr_iterator It,
                        MachineBasicBlock &Block, WaitcntBrackets &ScoreBrackets,
@@ -1932,12 +1941,12 @@ static bool callWaitsOnFunctionReturn(const MachineInstr &MI) { return true; }
 ///  and if so what the value of each counter is.
 ///  The "score bracket" is bound by the lower bound and upper bound
 ///  scores (*_score_LB and *_score_ub respectively).
-///  If FlushVmCnt is true, that means that we want to generate a s_waitcnt to
-///  flush the vmcnt counter here.
-bool SIInsertWaitcnts::generateWaitcntInstBefore(MachineInstr &MI,
-                                                 WaitcntBrackets &ScoreBrackets,
-                                                 MachineInstr *OldWaitcntInstr,
-                                                 bool FlushVmCnt) {
+///  If FlushFlags.FlushVmCnt is true, we want to flush the vmcnt counter here.
+///  If FlushFlags.FlushDsCnt is true, we want to flush the dscnt counter here
+///  (GFX12+ only, where DS_CNT is a separate counter).
+bool SIInsertWaitcnts::generateWaitcntInstBefore(
+    MachineInstr &MI, WaitcntBrackets &ScoreBrackets,
+    MachineInstr *OldWaitcntInstr, PreheaderFlushFlags FlushFlags) {
   setForceEmitWaitcnt();
 
   assert(!MI.isMetaInstruction());
@@ -2201,7 +2210,7 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(MachineInstr &MI,
   if (ForceEmitWaitcnt[X_CNT])
     Wait.XCnt = 0;
 
-  if (FlushVmCnt) {
+  if (FlushFlags.FlushVmCnt) {
     if (ScoreBrackets.hasPendingEvent(LOAD_CNT))
       Wait.LoadCnt = 0;
     if (ScoreBrackets.hasPendingEvent(SAMPLE_CNT))
@@ -2209,6 +2218,9 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(MachineInstr &MI,
     if (ScoreBrackets.hasPendingEvent(BVH_CNT))
       Wait.BvhCnt = 0;
   }
+
+  if (FlushFlags.FlushDsCnt && ScoreBrackets.hasPendingEvent(DS_CNT))
+    Wait.DsCnt = 0;
 
   if (ForceEmitZeroLoadFlag && Wait.LoadCnt != ~0u)
     Wait.LoadCnt = 0;
@@ -2579,12 +2591,13 @@ bool SIInsertWaitcnts::insertWaitcntInBlock(MachineFunction &MF,
       continue;
     }
 
-    bool FlushVmCnt = Block.getFirstTerminator() == Inst &&
-                      isPreheaderToFlush(Block, ScoreBrackets);
+    PreheaderFlushFlags FlushFlags;
+    if (Block.getFirstTerminator() == Inst)
+      FlushFlags = isPreheaderToFlush(Block, ScoreBrackets);
 
     // Generate an s_waitcnt instruction to be placed before Inst, if needed.
     Modified |= generateWaitcntInstBefore(Inst, ScoreBrackets, OldWaitcntInstr,
-                                          FlushVmCnt);
+                                          FlushFlags);
     OldWaitcntInstr = nullptr;
 
     // Restore vccz if it's not known to be correct already.
@@ -2658,17 +2671,21 @@ bool SIInsertWaitcnts::insertWaitcntInBlock(MachineFunction &MF,
     ++Iter;
   }
 
-  // Flush the LOADcnt, SAMPLEcnt and BVHcnt counters at the end of the block if
-  // needed.
+  // Flush counters at the end of the block if needed (for preheaders with no
+  // terminator).
   AMDGPU::Waitcnt Wait;
-  if (Block.getFirstTerminator() == Block.end() &&
-      isPreheaderToFlush(Block, ScoreBrackets)) {
-    if (ScoreBrackets.hasPendingEvent(LOAD_CNT))
-      Wait.LoadCnt = 0;
-    if (ScoreBrackets.hasPendingEvent(SAMPLE_CNT))
-      Wait.SampleCnt = 0;
-    if (ScoreBrackets.hasPendingEvent(BVH_CNT))
-      Wait.BvhCnt = 0;
+  if (Block.getFirstTerminator() == Block.end()) {
+    PreheaderFlushFlags FlushFlags = isPreheaderToFlush(Block, ScoreBrackets);
+    if (FlushFlags.FlushVmCnt) {
+      if (ScoreBrackets.hasPendingEvent(LOAD_CNT))
+        Wait.LoadCnt = 0;
+      if (ScoreBrackets.hasPendingEvent(SAMPLE_CNT))
+        Wait.SampleCnt = 0;
+      if (ScoreBrackets.hasPendingEvent(BVH_CNT))
+        Wait.BvhCnt = 0;
+    }
+    if (FlushFlags.FlushDsCnt && ScoreBrackets.hasPendingEvent(DS_CNT))
+      Wait.DsCnt = 0;
   }
 
   // Combine or remove any redundant waitcnts at the end of the block.
@@ -2684,29 +2701,29 @@ bool SIInsertWaitcnts::insertWaitcntInBlock(MachineFunction &MF,
   return Modified;
 }
 
-// Return true if the given machine basic block is a preheader of a loop in
-// which we want to flush the vmcnt counter, and false otherwise.
-bool SIInsertWaitcnts::isPreheaderToFlush(
-    MachineBasicBlock &MBB, const WaitcntBrackets &ScoreBrackets) {
-  auto [Iterator, IsInserted] = PreheadersToFlush.try_emplace(&MBB, false);
+// Return flags indicating which counters should be flushed in the preheader.
+PreheaderFlushFlags
+SIInsertWaitcnts::isPreheaderToFlush(MachineBasicBlock &MBB,
+                                     const WaitcntBrackets &ScoreBrackets) {
+  auto [Iterator, IsInserted] =
+      PreheadersToFlush.try_emplace(&MBB, PreheaderFlushFlags());
   if (!IsInserted)
     return Iterator->second;
 
   MachineBasicBlock *Succ = MBB.getSingleSuccessor();
   if (!Succ)
-    return false;
+    return PreheaderFlushFlags();
 
   MachineLoop *Loop = MLI->getLoopFor(Succ);
   if (!Loop)
-    return false;
+    return PreheaderFlushFlags();
 
-  if (Loop->getLoopPreheader() == &MBB &&
-      shouldFlushVmCnt(Loop, ScoreBrackets)) {
-    Iterator->second = true;
-    return true;
+  if (Loop->getLoopPreheader() == &MBB) {
+    Iterator->second = getPreheaderFlushFlags(Loop, ScoreBrackets);
+    return Iterator->second;
   }
 
-  return false;
+  return PreheaderFlushFlags();
 }
 
 bool SIInsertWaitcnts::isVMEMOrFlatVMEM(const MachineInstr &MI) const {
@@ -2715,28 +2732,119 @@ bool SIInsertWaitcnts::isVMEMOrFlatVMEM(const MachineInstr &MI) const {
   return SIInstrInfo::isVMEM(MI);
 }
 
-// Return true if it is better to flush the vmcnt counter in the preheader of
-// the given loop. We currently decide to flush in two situations:
+bool SIInsertWaitcnts::isDSRead(const MachineInstr &MI) const {
+  return SIInstrInfo::isDS(MI) && MI.mayLoad() && !MI.mayStore();
+}
+
+// Check if instruction may store to LDS (including DS stores, atomics,
+// FLAT instructions that may access LDS, LDS DMA, and tensor load to LDS).
+bool SIInsertWaitcnts::mayStoreLDS(const MachineInstr &MI) const {
+  if (SIInstrInfo::mayWriteLDSThroughDMA(MI))
+    return true;
+  unsigned Opc = MI.getOpcode();
+  if (Opc == AMDGPU::TENSOR_LOAD_TO_LDS || Opc == AMDGPU::TENSOR_LOAD_TO_LDS_D2)
+    return true;
+  if (!MI.mayStore())
+    return false;
+  if (SIInstrInfo::isDS(MI))
+    return true;
+  if (SIInstrInfo::isFLAT(MI) && TII->mayAccessLDSThroughFlat(MI))
+    return true;
+  return false;
+}
+
+// Return flags indicating which counters should be flushed in the preheader of
+// the given loop. We currently decide to flush in the following situations:
+// For VMEM (FlushVmCnt):
 // 1. The loop contains vmem store(s), no vmem load and at least one use of a
 //    vgpr containing a value that is loaded outside of the loop. (Only on
 //    targets with no vscnt counter).
 // 2. The loop contains vmem load(s), but the loaded values are not used in the
 //    loop, and at least one use of a vgpr containing a value that is loaded
 //    outside of the loop.
-bool SIInsertWaitcnts::shouldFlushVmCnt(MachineLoop *ML,
-                                        const WaitcntBrackets &Brackets) {
+// For DS (FlushDsCnt, GFX12+ only):
+// 3. The loop has DS prefetch loads that potentially benefit from preheader
+// flushing.
+//    For single-block loops, barrier is optional; for multi-block loops,
+//    barrier in latch block is required. Only DS loads after the last barrier
+//    (if one exists or is required) in the latch block are considered potential
+//    prefetches. When a DS load is consumed in the same iteration, it and all
+//    prior DS loads are implicitly "flushed" due to FIFO ordering. Only DS
+//    loads issued AFTER the last such flush point and used in the next
+//    iteration are considered true prefetches. No DS stores in the tracked
+//    range.
+PreheaderFlushFlags
+SIInsertWaitcnts::getPreheaderFlushFlags(MachineLoop *ML,
+                                         const WaitcntBrackets &Brackets) {
+  PreheaderFlushFlags Flags;
   bool HasVMemLoad = false;
   bool HasVMemStore = false;
-  bool UsesVgprLoadedOutside = false;
+  bool UsesVgprLoadedOutsideVMEM = false;
+  bool UsesVgprLoadedOutsideDS = false;
+  bool VMemInvalidated = false;
+  // DS optimization only applies to GFX12+ where DS_CNT is separate.
+  bool DSInvalidated = !ST->hasExtendedWaitCounts();
   DenseSet<MCRegUnit> VgprUse;
-  DenseSet<MCRegUnit> VgprDef;
+  DenseSet<MCRegUnit> VgprDefVMEM;
+
+  // Determine loop structure and find the relevant barrier.
+  // For single-block loops: barrier is optional
+  // For multi-block loops: barrier in latch block is required
+  bool IsSingleBlock = (ML->getNumBlocks() == 1);
+  MachineBasicBlock *DSOptBlock = nullptr; // Block to analyze for DS opt
+  const MachineInstr *LastBarrier = nullptr;
+
+  if (!DSInvalidated) {
+    DSOptBlock = ML->getLoopLatch();
+    if (!DSOptBlock)
+      DSInvalidated = true;
+
+    // Find the last barrier in the latch block
+    if (DSOptBlock) {
+      for (const MachineInstr &MI : *DSOptBlock) {
+        if (MI.getOpcode() == AMDGPU::S_BARRIER ||
+            MI.getOpcode() == AMDGPU::S_BARRIER_SIGNAL_IMM ||
+            MI.getOpcode() == AMDGPU::S_BARRIER_SIGNAL_ISFIRST_IMM)
+          LastBarrier = &MI;
+      }
+      // For multi-block loops, barrier is required
+      if (!IsSingleBlock && !LastBarrier)
+        DSInvalidated = true;
+    }
+
+    LLVM_DEBUG(dbgs() << "DS Preheader Flush: loop header="
+                      << printMBBReference(*ML->getHeader())
+                      << ", single_block=" << IsSingleBlock
+                      << ", barrier=" << (LastBarrier ? "found" : "none")
+                      << ", DSInvalidated=" << DSInvalidated << "\n");
+  }
+
+  // Track DS loads with their position (order) to handle flush points.
+  // When a DS load is consumed (used) in the same iteration, that load and
+  // all prior loads are "flushed" due to FIFO ordering. Only loads issued
+  // AFTER the last flush point are true prefetches.
+  // Map: RegUnit -> load position (1-based, 0 means not tracked)
+  DenseMap<unsigned, unsigned> DSLoadPosition;
+  unsigned DSLoadCount = 0;
+  unsigned LastFlushedPosition = 0;
 
   for (MachineBasicBlock *MBB : ML->blocks()) {
+    // Determine if we should track DS loads in this block.
+    // For single-block: track after barrier (or all if no barrier)
+    // For multi-block: only track in DSOptBlock after the barrier
+    bool InDSOptBlock = (MBB == DSOptBlock);
+    bool AfterBarrier =
+        (LastBarrier == nullptr); // If no barrier, always "after"
+
     for (MachineInstr &MI : *MBB) {
       if (isVMEMOrFlatVMEM(MI)) {
         HasVMemLoad |= MI.mayLoad();
         HasVMemStore |= MI.mayStore();
       }
+
+      // Check if we've passed the barrier
+      if (InDSOptBlock && &MI == LastBarrier)
+        AfterBarrier = true;
 
       for (const MachineOperand &Op : MI.all_uses()) {
         if (Op.isDebug() || !TRI->isVectorRegister(*MRI, Op.getReg()))
@@ -2744,21 +2852,64 @@ bool SIInsertWaitcnts::shouldFlushVmCnt(MachineLoop *ML,
         // Vgpr use
         for (MCRegUnit RU : TRI->regunits(Op.getReg().asMCReg())) {
           // If we find a register that is loaded inside the loop, 1. and 2.
-          // are invalidated and we can exit.
-          if (VgprDef.contains(RU))
-            return false;
+          // are invalidated.
+          if (VgprDefVMEM.contains(RU))
+            VMemInvalidated = true;
+
+          // Early exit if both optimizations are invalidated
+          if (VMemInvalidated && DSInvalidated)
+            return Flags;
+
+          // Check for DS load used in same iteration - this creates a flush
+          // point. All DS loads up to and including this one are flushed.
+          if (!DSInvalidated) {
+            auto It = DSLoadPosition.find(static_cast<unsigned>(RU));
+            if (It != DSLoadPosition.end() &&
+                It->second > LastFlushedPosition) {
+              LLVM_DEBUG(dbgs()
+                         << "  DS flush point: load at position " << It->second
+                         << " used, flushing 1-" << It->second << "\n");
+              LastFlushedPosition = It->second;
+            }
+          }
+
           VgprUse.insert(RU);
-          // If at least one of Op's registers is in the score brackets, the
-          // value is likely loaded outside of the loop.
+          // Check if this register has a pending VMEM load from outside the
+          // loop (value loaded outside and used inside).
           VMEMID ID = toVMEMID(RU);
-          if (Brackets.getVMemScore(ID, LOAD_CNT) >
+          bool HasPendingVMEM =
+              Brackets.getVMemScore(ID, LOAD_CNT) >
                   Brackets.getScoreLB(LOAD_CNT) ||
               Brackets.getVMemScore(ID, SAMPLE_CNT) >
                   Brackets.getScoreLB(SAMPLE_CNT) ||
-              Brackets.getVMemScore(ID, BVH_CNT) >
-                  Brackets.getScoreLB(BVH_CNT)) {
-            UsesVgprLoadedOutside = true;
-            break;
+              Brackets.getVMemScore(ID, BVH_CNT) > Brackets.getScoreLB(BVH_CNT);
+          if (HasPendingVMEM)
+            UsesVgprLoadedOutsideVMEM = true;
+          // Check if loaded outside the loop via DS (not VMEM/FLAT).
+          // Only consider it a DS load if there's no pending VMEM load for
+          // this register, since FLAT can set both counters.
+          if (!HasPendingVMEM &&
+              Brackets.getVMemScore(ID, DS_CNT) > Brackets.getScoreLB(DS_CNT))
+            UsesVgprLoadedOutsideDS = true;
+        }
+      }
+
+      // Check for any def that overwrites a pending DS-loaded register.
+      // This is also a flush point because the DS load must complete before
+      // the register can be overwritten (WAW hazard).
+      if (!DSInvalidated) {
+        for (const MachineOperand &Op : MI.all_defs()) {
+          if (!TRI->isVectorRegister(*MRI, Op.getReg()))
+            continue;
+          for (MCRegUnit RU : TRI->regunits(Op.getReg().asMCReg())) {
+            auto It = DSLoadPosition.find(static_cast<unsigned>(RU));
+            if (It != DSLoadPosition.end() &&
+                It->second > LastFlushedPosition) {
+              LLVM_DEBUG(dbgs()
+                         << "  DS flush point: load at position " << It->second
+                         << " overwritten, flushing 1-" << It->second << "\n");
+              LastFlushedPosition = It->second;
+            }
           }
         }
       }
@@ -2768,18 +2919,64 @@ bool SIInsertWaitcnts::shouldFlushVmCnt(MachineLoop *ML,
         for (const MachineOperand &Op : MI.all_defs()) {
           for (MCRegUnit RU : TRI->regunits(Op.getReg().asMCReg())) {
             // If we find a register that is loaded inside the loop, 1. and 2.
-            // are invalidated and we can exit.
+            // are invalidated.
             if (VgprUse.contains(RU))
-              return false;
-            VgprDef.insert(RU);
+              VMemInvalidated = true;
+            VgprDefVMEM.insert(RU);
+          }
+        }
+        // Early exit if both optimizations are invalidated
+        if (VMemInvalidated && DSInvalidated)
+          return Flags;
+      }
+
+      // DS read vgpr def - track with position if in the right block and
+      // after the barrier (or always if single-block with no barrier)
+      if (!DSInvalidated && InDSOptBlock && AfterBarrier && isDSRead(MI)) {
+        ++DSLoadCount;
+        for (const MachineOperand &Op : MI.all_defs()) {
+          for (MCRegUnit RU : TRI->regunits(Op.getReg().asMCReg())) {
+            DSLoadPosition[static_cast<unsigned>(RU)] = DSLoadCount;
           }
         }
       }
+
+      // DS store after barrier invalidates the optimization.
+      // DS stores share DS_CNT with DS reads, and we can't distinguish
+      // which loads have completed vs which stores have completed.
+      if (!DSInvalidated && InDSOptBlock && AfterBarrier && mayStoreLDS(MI)) {
+        LLVM_DEBUG(dbgs() << "  DSInvalidated: DS store after barrier\n");
+        DSInvalidated = true;
+      }
     }
   }
-  if (!ST->hasVscnt() && HasVMemStore && !HasVMemLoad && UsesVgprLoadedOutside)
-    return true;
-  return HasVMemLoad && UsesVgprLoadedOutside && ST->hasVmemWriteVgprInOrder();
+
+  // Check if there are any DS loads AFTER the last flush point.
+  // These are true prefetch loads that are not consumed in the same iteration.
+  bool HasUnflushedDSLoads = (DSLoadCount > LastFlushedPosition);
+
+  LLVM_DEBUG(dbgs() << "DS Preheader Flush: DSLoadCount=" << DSLoadCount
+                    << ", LastFlushedPosition=" << LastFlushedPosition
+                    << ", HasUnflushedDSLoads=" << HasUnflushedDSLoads << "\n");
+
+  // VMEM flush decision
+  if (!VMemInvalidated && UsesVgprLoadedOutsideVMEM &&
+      ((!ST->hasVscnt() && HasVMemStore && !HasVMemLoad) ||
+       (HasVMemLoad && ST->hasVmemWriteVgprInOrder())))
+    Flags.FlushVmCnt = true;
+
+  // DS flush decision: flush if loop uses DS-loaded values from outside
+  // AND there are unflushed DS loads (true prefetches) at the backedge.
+  LLVM_DEBUG(dbgs() << "DS Preheader Flush decision: DSInvalidated="
+                    << DSInvalidated
+                    << ", UsesVgprLoadedOutsideDS=" << UsesVgprLoadedOutsideDS
+                    << ", HasUnflushedDSLoads=" << HasUnflushedDSLoads << "\n");
+  if (!DSInvalidated && UsesVgprLoadedOutsideDS && HasUnflushedDSLoads)
+    Flags.FlushDsCnt = true;
+
+  LLVM_DEBUG(dbgs() << "Final: FlushVmCnt=" << Flags.FlushVmCnt
+                    << ", FlushDsCnt=" << Flags.FlushDsCnt << "\n");
+  return Flags;
 }
 
 bool SIInsertWaitcntsLegacy::runOnMachineFunction(MachineFunction &MF) {
